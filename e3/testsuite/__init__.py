@@ -18,6 +18,11 @@ import sys
 import re
 import tempfile
 
+try:
+    from lxml import etree
+except ImportError:
+    import xml.etree.ElementTree as etree
+
 logger = logging.getLogger('testsuite')
 
 
@@ -82,11 +87,13 @@ class TestsuiteCore(object):
     variables.
     """
 
-    def __init__(self, root_dir):
+    def __init__(self, root_dir, testsuite_name='Untitled testsute'):
         """Testsuite constructor.
 
         :param root_dir: root dir of the testsuite. Usually the directory in
             which testsuite.py and runtest.py are located
+        :param str testsuite_name: Name for this testsuite. It can be used to
+            provide a title in some report formats.
         :type root_dir: str | unicode
         """
         self.root_dir = os.path.abspath(root_dir)
@@ -96,6 +103,7 @@ class TestsuiteCore(object):
         self.results = {}
         self.test_counter = 0
         self.test_status_counters = {s: 0 for s in TestStatus}
+        self.testsuite_name = testsuite_name
 
     def test_result_filename(self, test_name):
         """Return the name of the file in which the result are stored.
@@ -196,6 +204,12 @@ class TestsuiteCore(object):
             " file can then be sourced from a Bourne shell to recreate"
             " the environement that existed when this testsuite was run"
             " to produce a given testsuite report.")
+        parser.add_argument(
+            "--xunit-output",
+            dest="xunit_output",
+            help="Output testsuite report to the given file in the standard"
+                 " XUnit XML format. This is useful to display results in"
+                 " continuous build systems such as Jenkins.")
         parser.add_argument('sublist', metavar='tests', nargs='*',
                             default=[],
                             help='test')
@@ -261,6 +275,8 @@ class TestsuiteCore(object):
         self.scheduler.run(actions)
 
         self.dump_testsuite_result()
+        if self.main.args.xunit_output:
+            self.dump_xunit_report(self.main.args.xunit_output)
 
         # Clean everything
         self.tear_down()
@@ -320,6 +336,90 @@ class TestsuiteCore(object):
     def dump_testsuite_result(self):
         """To be implemented."""
         pass
+
+    def dump_xunit_report(self, filename):
+        """
+        Dump a testsuite report to `filname` in the standard XUnit XML format.
+
+        :param str filename: Name of the text file to write.
+        """
+        from e3.testsuite.result import TestStatus
+
+        testsuites = etree.Element('testsuites', name=self.testsuite_name)
+        testsuite = etree.Element('testsuite', name=self.testsuite_name)
+        testsuites.append(testsuite)
+
+        # Counters for each category of test in XUnit. We map TestStatus to
+        # these.
+        counters = {'tests': 0, 'errors': 0, 'failures': 0, 'skipped': 0}
+        status_to_counter = {TestStatus.PASS: None,
+                             TestStatus.FAIL: 'failures',
+                             TestStatus.UNSUPPORTED: 'skipped',
+                             TestStatus.XFAIL: 'failures',
+                             TestStatus.XPASS: None,
+                             TestStatus.ERROR: 'errors',
+                             TestStatus.UNRESOLVED: 'errors',
+                             TestStatus.UNTESTED: 'skipped'}
+
+        # Markup to create inside <testcase> elements for each category of test
+        # in XUnit.
+        counter_to_markup = {'failures': 'failure',
+                             'skipped': 'skipped',
+                             'errors': 'error'}
+
+        # Now create a <testcase> element for each test
+        for test_name in sorted(self.results):
+            with open(self.test_result_filename(test_name), 'rb') as f:
+                result = yaml.load(f)
+
+            # The only class involved in testcases (that we know of in this
+            # testsuite framework) is the TestDriver subclass, but this is not
+            # useful for the report, so leave this dummy "e3-testsuite-driver"
+            # instead.
+            testcase = etree.Element(
+                'testcase', name=test_name, classname='e3-testsuite-driver')
+            testsuite.append(testcase)
+
+            # Get the XUnit-equivalent status for this test and update the
+            # corresponding counters.
+            counter_key = status_to_counter[result.status]
+            if counter_key:
+                counters[counter_key] += 1
+            counters['tests'] += 1
+
+            # If applicable, create an element to describe the test status. In
+            # any case, if we have logs, include them in the report to ease
+            # post-mortem debugging. They are included in a standalone
+            # "system-out" element in case the test succeeded, or directly in
+            # the status element if the test failed.
+            markup = counter_to_markup.get(counter_key, None)
+            if markup:
+                status_elt = etree.Element(markup)
+                testcase.append(status_elt)
+                if (
+                    counter_key in ('skipped', 'errors', 'failures') and
+                    result.msg
+                ):
+                    status_elt.set('message', result.msg)
+
+                if counter_key in ('errors', 'failures'):
+                    status_elt.set('type', 'error')
+
+                status_elt.text = result.log
+
+            elif result.log:
+                system_out = etree.Element('system-out')
+                system_out.text = result.log
+                testcase.append(system_out)
+
+        # Include counters in <testsuite> and <testsuites> elements
+        for key, count in sorted(counters.items()):
+            testsuite.set(key, str(count))
+            testsuites.set(key, str(count))
+
+        # The report is ready: write it to the requested file
+        tree = etree.ElementTree(testsuites)
+        tree.write(filename, encoding='utf-8', xml_declaration=True)
 
     def collect_result(self, job):
         """Run internal function.
